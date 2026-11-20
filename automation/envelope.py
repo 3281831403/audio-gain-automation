@@ -11,18 +11,90 @@ Functions that build or evaluate an envelope normalize keyframe input
 before use: points are sorted by sample index and duplicate indices keep
 the last value.  Inputs are never mutated.  Unless a tighter bound is
 stated, absolute comparisons use a tolerance of ``1e-6``.
-
-This module is intentionally a stub collection for a bug-fix exercise:
-each public function raises :class:`NotImplementedError` until it is
-implemented.
 """
+
+import math
+from bisect import bisect_left
 
 GAIN_DB_MIN = -120.0
 GAIN_DB_MAX = 120.0
 
+_CURVES = frozenset(("linear", "hold", "exponential"))
+_TOL = 1e-6
+
 
 class AutomationError(ValueError):
     """Raised for malformed keyframes, samples, or automation parameters."""
+
+
+def _is_int(value) -> bool:
+    """Return ``True`` for a real integer sample index (not a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value) -> bool:
+    """Return ``True`` for a real numeric value (not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _check_index(index, what: str = "sample index") -> int:
+    if not _is_int(index) or index < 0:
+        raise AutomationError(f"{what} must be a non-negative integer")
+    return int(index)
+
+
+def _check_gain(gain, what: str = "gain_db") -> float:
+    if (
+        not _is_number(gain)
+        or not math.isfinite(gain)
+        or gain < GAIN_DB_MIN
+        or gain > GAIN_DB_MAX
+    ):
+        raise AutomationError(
+            f"{what} must be finite and within "
+            f"[{GAIN_DB_MIN:g}, {GAIN_DB_MAX:g}] dB"
+        )
+    return float(gain)
+
+
+def _check_curve(curve) -> str:
+    if curve not in _CURVES:
+        raise AutomationError(f"unknown curve: {curve!r}")
+    return curve
+
+
+def _normalize(points) -> list[tuple[int, float]]:
+    """Sort keyframes by sample index, keeping the last duplicate value.
+
+    A new list of new tuples is returned; the input is never mutated.
+    Malformed indices or gains raise :class:`AutomationError`.
+    """
+    if isinstance(points, (str, bytes)):
+        raise AutomationError("points must be a sequence of keyframes")
+    try:
+        raw = list(points)
+    except TypeError as exc:
+        raise AutomationError(
+            "points must be a sequence of keyframes"
+        ) from exc
+
+    parsed: list[tuple[int, float]] = []
+    for point in raw:
+        if not isinstance(point, (tuple, list)) or len(point) != 2:
+            raise AutomationError(f"malformed keyframe: {point!r}")
+        index, gain = point
+        parsed.append((_check_index(index), _check_gain(gain)))
+
+    # ``sorted`` is stable, so for equal indices the value occurring later
+    # in the original list comes last and wins the duplicate overwrite.
+    parsed.sort(key=lambda item: item[0])
+    result: list[tuple[int, float]] = []
+    for index, gain in parsed:
+        if result and result[-1][0] == index:
+            result[-1] = (index, gain)
+        else:
+            result.append((index, gain))
+    return result
 
 
 def insert_point(
@@ -45,7 +117,33 @@ def insert_point(
         AutomationError: if ``index`` is not a non-negative integer, or
             ``gain_db`` is non-finite or outside ``[-120, 120]``.
     """
-    raise NotImplementedError
+    index = _check_index(index)
+    gain_db = _check_gain(gain_db)
+
+    result = _normalize(points)
+    position = bisect_left([item[0] for item in result], index)
+    if position < len(result) and result[position][0] == index:
+        result[position] = (index, gain_db)
+    else:
+        result.insert(position, (index, gain_db))
+    return result
+
+
+def _crossfade(
+    gain0_db: float,
+    gain1_db: float,
+    t: float,
+    curve: str,
+) -> float:
+    """Interpolate between two gains with ``t`` in ``[0, 1]``."""
+    if curve == "linear":
+        return gain0_db + (gain1_db - gain0_db) * t
+    if curve == "hold":
+        return gain0_db
+    # exponential: linear in amplitude, i.e. perceptually smooth level.
+    amp0 = db_to_linear(gain0_db)
+    amp1 = db_to_linear(gain1_db)
+    return linear_to_db(amp0 + (amp1 - amp0) * t)
 
 
 def interpolate(
@@ -79,7 +177,77 @@ def interpolate(
             non-negative integer, ``curve`` is unknown, or a keyframe is
             malformed.
     """
-    raise NotImplementedError
+    index = _check_index(index)
+    _check_curve(curve)
+    normalized = _normalize(points)
+    if not normalized:
+        raise AutomationError("cannot interpolate an empty keyframe list")
+    return _search(normalized, [item[0] for item in normalized], index, curve)
+
+
+def _search(
+    normalized: list[tuple[int, float]],
+    indices: list[int],
+    index: int,
+    curve: str,
+) -> float:
+    """Evaluate a normalized envelope with precomputed ``indices``."""
+    position = bisect_left(indices, index)
+
+    # On a keyframe (indices are integers, so this is exact).
+    if position < len(normalized) and indices[position] == index:
+        return normalized[position][1]
+    # Outside the envelope: hold the nearest endpoint gain.
+    if position == 0:
+        return normalized[0][1]
+    if position == len(normalized):
+        return normalized[-1][1]
+
+    index0, gain0 = normalized[position - 1]
+    index1, gain1 = normalized[position]
+    t = (index - index0) / (index1 - index0)
+    return _crossfade(gain0, gain1, t, curve)
+
+
+def db_to_linear(db: float) -> float:
+    """Convert dBFS to linear gain with ``10 ** (db / 20)``.
+
+    ``db == 0`` returns exactly ``1.0``.  This is the inverse of
+    :func:`linear_to_db` for positive linear gains.  No clipping is
+    performed, and absolute comparisons use a tolerance of ``1e-6``.
+    """
+    return 10.0 ** (db / 20.0)
+
+
+def linear_to_db(x: float) -> float:
+    """Convert a linear gain to dBFS with ``20 * log10(x)``.
+
+    ``x <= 0`` returns negative infinity instead of raising a
+    divide-by-zero or math-domain error.  ``x == 1`` returns ``0.0``.
+    Positive values use the standard dB formula, and absolute comparisons
+    use a tolerance of ``1e-6``.
+    """
+    if x <= 0.0:
+        return float("-inf")
+    return 20.0 * math.log10(x)
+
+
+def _coerce_samples(samples) -> list[float]:
+    if isinstance(samples, (str, bytes)):
+        raise AutomationError("samples must be a sequence of finite numbers")
+    try:
+        raw = list(samples)
+    except TypeError as exc:
+        raise AutomationError(
+            "samples must be a sequence of finite numbers"
+        ) from exc
+
+    result: list[float] = []
+    for sample in raw:
+        if not _is_number(sample) or not math.isfinite(sample):
+            raise AutomationError(f"non-finite sample: {sample!r}")
+        result.append(float(sample))
+    return result
 
 
 def apply_gain(
@@ -107,7 +275,21 @@ def apply_gain(
         AutomationError: for a non-finite sample, invalid keyframes, or an
             unknown ``curve``.
     """
-    raise NotImplementedError
+    _check_curve(curve)
+    normalized = _normalize(points)
+    values = _coerce_samples(samples)
+
+    if not normalized:
+        return values
+    if not values:
+        return []
+
+    output: list[float] = []
+    indices = [item[0] for item in normalized]
+    for position, sample in enumerate(values):
+        gain_db = _search(normalized, indices, position, curve)
+        output.append(sample * db_to_linear(gain_db))
+    return output
 
 
 def ramp(
@@ -143,28 +325,35 @@ def ramp(
         AutomationError: for invalid bounds, gains, keyframes, or an
             unknown ``curve``.
     """
-    raise NotImplementedError
+    start = _check_index(start, "start")
+    end = _check_index(end, "end")
+    if end <= start:
+        raise AutomationError("end must be greater than start")
+    from_db = _check_gain(from_db, "from_db")
+    to_db = _check_gain(to_db, "to_db")
+    _check_curve(curve)
 
+    kept = [
+        (index, gain)
+        for index, gain in _normalize(points)
+        if index < start or index > end
+    ]
 
-def db_to_linear(db: float) -> float:
-    """Convert dBFS to linear gain with ``10 ** (db / 20)``.
+    span = end - start
+    ramp_points: list[tuple[int, float]] = []
+    for index in range(start, end + 1):
+        if curve == "hold":
+            gain = from_db if index < end else to_db
+        elif index == start:
+            gain = from_db
+        elif index == end:
+            gain = to_db
+        else:
+            t = (index - start) / span
+            gain = _crossfade(from_db, to_db, t, curve)
+        ramp_points.append((index, gain))
 
-    ``db == 0`` returns exactly ``1.0``.  This is the inverse of
-    :func:`linear_to_db` for positive linear gains.  No clipping is
-    performed, and absolute comparisons use a tolerance of ``1e-6``.
-    """
-    raise NotImplementedError
-
-
-def linear_to_db(x: float) -> float:
-    """Convert a linear gain to dBFS with ``20 * log10(x)``.
-
-    ``x <= 0`` returns negative infinity instead of raising a
-    divide-by-zero or math-domain error.  ``x == 1`` returns ``0.0``.
-    Positive values use the standard dB formula, and absolute comparisons
-    use a tolerance of ``1e-6``.
-    """
-    raise NotImplementedError
+    return _normalize(kept + ramp_points)
 
 
 def trim_outliers(
@@ -192,7 +381,45 @@ def trim_outliers(
             adjacent sample positions and cannot be bridged with an integer
             keyframe.
     """
-    raise NotImplementedError
+    if (
+        not _is_number(max_step_db)
+        or not math.isfinite(max_step_db)
+        or max_step_db <= 0.0
+    ):
+        raise AutomationError("max_step_db must be positive and finite")
+
+    normalized = _normalize(points)
+    if len(normalized) < 2:
+        return normalized
+
+    result: list[tuple[int, float]] = [normalized[0]]
+
+    def split(
+        index0: int,
+        gain0: float,
+        index1: int,
+        gain1: float,
+    ) -> None:
+        """Append the bounded interior of (index0, index1), then index1."""
+        difference = abs(gain1 - gain0)
+        if difference <= max_step_db + _TOL:
+            result.append((index1, gain1))
+            return
+        if index1 - index0 < 2:
+            raise AutomationError(
+                "oversized gain jump between adjacent sample positions"
+            )
+        midpoint = (index0 + index1) // 2
+        mid_gain = (gain0 + gain1) / 2.0
+        split(index0, gain0, midpoint, mid_gain)
+        split(midpoint, mid_gain, index1, gain1)
+
+    for (index0, gain0), (index1, gain1) in zip(
+        normalized, normalized[1:]
+    ):
+        split(index0, gain0, index1, gain1)
+
+    return result
 
 
 def validate(points: list[tuple[int, float]]) -> list[str]:
@@ -214,7 +441,55 @@ def validate(points: list[tuple[int, float]]) -> list[str]:
     The input is not modified.  These structural checks do not apply the
     ``1e-6`` interpolation tolerance; the gain bounds are inclusive.
     """
-    raise NotImplementedError
+    if isinstance(points, (str, bytes)):
+        raise AutomationError("points must be a sequence of keyframes")
+    try:
+        raw = list(points)
+    except TypeError as exc:
+        raise AutomationError(
+            "points must be a sequence of keyframes"
+        ) from exc
+
+    bad_index = False
+    not_sorted = False
+    duplicate = False
+    bad_gain = False
+    previous_index = None
+    seen: set[int] = set()
+
+    for point in raw:
+        if not isinstance(point, (tuple, list)) or len(point) != 2:
+            raise AutomationError(f"malformed keyframe: {point!r}")
+        index, gain = point
+
+        if not _is_int(index) or index < 0:
+            bad_index = True
+        else:
+            if previous_index is not None and index < previous_index:
+                not_sorted = True
+            if index in seen:
+                duplicate = True
+            seen.add(index)
+            previous_index = index
+
+        if (
+            not _is_number(gain)
+            or not math.isfinite(gain)
+            or gain < GAIN_DB_MIN
+            or gain > GAIN_DB_MAX
+        ):
+            bad_gain = True
+
+    problems: list[str] = []
+    if bad_index:
+        problems.append("sample index must be a non-negative integer")
+    if not_sorted:
+        problems.append("sample indices are not sorted")
+    if duplicate:
+        problems.append("duplicate sample index")
+    if bad_gain:
+        problems.append("gain_db outside [-120, 120]")
+    return problems
 
 
 def automate_batch(
@@ -244,4 +519,23 @@ def automate_batch(
             unknown, a track is not a sample sequence, or any sample is not
             finite.
     """
-    raise NotImplementedError
+    problems = validate(points)
+    if problems:
+        raise AutomationError("; ".join(problems))
+    _check_curve(curve)
+
+    if not hasattr(tracks, "items"):
+        raise AutomationError("tracks must be a mapping of sample sequences")
+
+    # Validate and copy every track before producing any output so the
+    # operation stays all-or-nothing.
+    prepared: dict[str, list[float]] = {}
+    for name, samples in tracks.items():
+        prepared[name] = _coerce_samples(samples)
+
+    # A fresh apply_gain call per track means separate envelope evaluation
+    # and a distinct output list for every track.
+    return {
+        name: apply_gain(samples, points, curve)
+        for name, samples in prepared.items()
+    }
